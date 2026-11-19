@@ -118,6 +118,15 @@ impl LayerEntry<'_> {
 	}
 }
 
+/// Vertical slice settings for [top_layer]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Slice {
+	/// Blocks above this Y coordinate are ignored
+	pub max_y: Option<i32>,
+	/// Skip solid blocks below the cut until a non-opaque block is found
+	pub caves: bool,
+}
+
 /// Top layer data
 ///
 /// A LayerData stores block type, biome, block light and depth data for
@@ -154,7 +163,11 @@ impl LayerData {
 /// map. For water blocks, the height of the first non-water block
 /// is additionally filled in as the water depth (the block height is
 /// used as depth otherwise).
-pub fn top_layer(biome_list: &mut IndexSet<Biome>, chunk: &Chunk) -> Result<Option<LayerData>> {
+pub fn top_layer(
+	biome_list: &mut IndexSet<Biome>,
+	chunk: &Chunk,
+	slice: Slice,
+) -> Result<Option<LayerData>> {
 	use BLOCKS_PER_CHUNK as N;
 
 	if chunk.is_empty() {
@@ -163,6 +176,7 @@ pub fn top_layer(biome_list: &mut IndexSet<Biome>, chunk: &Chunk) -> Result<Opti
 
 	let mut done = 0;
 	let mut ret = LayerData::default();
+	let mut open = LayerBlockArray::<bool>::default();
 
 	for section in chunk.sections().rev() {
 		for y in BlockY::iter().rev() {
@@ -176,6 +190,19 @@ pub fn top_layer(biome_list: &mut IndexSet<Biome>, chunk: &Chunk) -> Result<Opti
 					}
 
 					let coords = SectionBlockCoords { xz, y };
+					if let Some(max_y) = slice.max_y {
+						if BlockHeight::new(section.y, y)?.0 > max_y {
+							continue;
+						}
+						if slice.caves && !open[xz] {
+							let opaque = section
+								.section
+								.block_at(coords)?
+								.is_some_and(|b| b.block_color.is(BlockFlag::Opaque));
+							open[xz] = !opaque;
+							continue;
+						}
+					}
 					if !entry.fill(biome_list, section, coords)? {
 						continue;
 					}

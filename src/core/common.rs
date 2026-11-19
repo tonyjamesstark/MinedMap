@@ -6,7 +6,7 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use regex::{Regex, RegexSet};
 use serde::{Deserialize, Serialize};
@@ -153,6 +153,8 @@ pub struct Config {
 	pub viewer_entities_path: PathBuf,
 	/// Format of generated map tiles
 	pub image_format: ImageFormat,
+	/// Slice settings for the top layer search
+	pub slice: layer::Slice,
 	/// Sign text filter patterns
 	pub sign_patterns: RegexSet,
 	/// Sign text transformation pattern
@@ -162,15 +164,24 @@ pub struct Config {
 impl Config {
 	/// Crates a new [Config] from [command line arguments](super::Args)
 	pub fn new(args: &super::Args) -> Result<Self> {
-		let mut region_dir: PathBuf = [
-			&args.input_dir,
-			Path::new("dimensions/minecraft/overworld/region"),
-		]
-		.iter()
-		.collect();
+		let mut region_dir = args
+			.input_dir
+			.join("dimensions/minecraft")
+			.join(&args.dimension)
+			.join("region");
 
 		if !region_processor::has_regions(&region_dir) {
-			region_dir = [&args.input_dir, Path::new("region")].iter().collect();
+			// Worlds from before 26.1 keep each dimension in its own legacy folder.
+			let legacy_dir = match args.dimension.as_str() {
+				"overworld" => "region",
+				"the_nether" => "DIM-1/region",
+				"the_end" => "DIM1/region",
+				other => bail!(
+					"dimension {other} not found in {}",
+					args.input_dir.display()
+				),
+			};
+			region_dir = args.input_dir.join(legacy_dir);
 		}
 
 		let level_dat_path = [&args.input_dir, Path::new("level.dat")].iter().collect();
@@ -199,6 +210,10 @@ impl Config {
 			entities_path_final,
 			viewer_info_path,
 			viewer_entities_path,
+			slice: layer::Slice {
+				max_y: args.max_y,
+				caves: args.caves,
+			},
 			image_format: args.image_format,
 			sign_patterns,
 			sign_transforms,

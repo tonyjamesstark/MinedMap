@@ -32,6 +32,7 @@ use tokio::runtime::Runtime;
 use tracing::{info, warn};
 
 use self::entity_collector::EntityCollector;
+use crate::io::fs;
 
 /// Returns the MinedMap version number
 fn version() -> &'static str {
@@ -100,6 +101,16 @@ pub struct Args {
 	/// are applied to each line of sign texts separately.
 	#[arg(long)]
 	pub sign_transform: Vec<String>,
+	/// Dimension to render, as named under dimensions/minecraft/
+	#[arg(long, default_value = "overworld")]
+	pub dimension: String,
+	/// Ignore blocks above this Y coordinate
+	#[arg(long, allow_negative_numbers = true)]
+	pub max_y: Option<i32>,
+	/// With --max-y, skip the solid blocks at the cut and render the first
+	/// floor below an open (non-opaque) block, showing caves and tunnels
+	#[arg(long, requires = "max_y")]
+	pub caves: bool,
 	/// Minecraft save directory
 	pub input_dir: PathBuf,
 	/// MinedMap data directory
@@ -117,12 +128,48 @@ fn setup_threads(num_threads: usize) -> Result<ThreadPool> {
 /// Runs all MinedMap generation steps, updating all tiles as needed
 fn generate(args: &Args, rt: &Runtime) -> Result<()> {
 	let config = Config::new(args)?;
+	check_slice(&config)?;
 
 	let regions = RegionProcessor::new(&config).run()?;
 	TileRenderer::new(&config, rt, &regions).run()?;
 	let tiles = TileMipmapper::new(&config, &regions).run()?;
 	EntityCollector::new(&config, &regions).run()?;
 	MetadataWriter::new(&config, &tiles).run()
+}
+
+/// Records the slice settings in the processed data directory, and refuses
+/// to reuse processed data that was generated with different settings
+///
+/// Processed data is only regenerated when region files change, so a
+/// changed --max-y or --caves would otherwise keep serving stale tiles.
+fn check_slice(config: &Config) -> Result<()> {
+	let path = config.processed_dir.join("slice.json");
+	let stored = match std::fs::read(&path) {
+		Ok(data) => serde_json::from_slice(&data)
+			.with_context(|| format!("Failed to parse {}", path.display()))?,
+		Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+			if config.processed_dir.exists() {
+				Default::default()
+			} else {
+				config.slice
+			}
+		}
+		Err(err) => {
+			return Err(err).with_context(|| format!("Failed to read {}", path.display()));
+		}
+	};
+	if stored != config.slice {
+		anyhow::bail!(
+			"{} was generated with {:?}, not {:?}; use a separate output directory per slice",
+			config.processed_dir.display(),
+			stored,
+			config.slice,
+		);
+	}
+	fs::create_dir_all(&config.processed_dir)?;
+	fs::create(&path, |file| {
+		Ok(serde_json::to_writer(file, &config.slice)?)
+	})
 }
 
 /// Creates a file watcher for the

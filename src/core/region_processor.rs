@@ -146,6 +146,8 @@ struct SingleRegionProcessor<'a> {
 	entities_needed: bool,
 	/// Format of generated map tiles
 	image_format: image::ImageFormat,
+	/// Slice settings for the top layer search
+	slice: world::layer::Slice,
 }
 
 impl<'a> SingleRegionProcessor<'a> {
@@ -183,6 +185,7 @@ impl<'a> SingleRegionProcessor<'a> {
 			lightmap_needed,
 			entities_needed,
 			image_format: processor.config.tile_image_format(),
+			slice: processor.config.slice,
 		})
 	}
 
@@ -277,7 +280,7 @@ impl<'a> SingleRegionProcessor<'a> {
 				biomes,
 				block_light,
 				depths,
-			}) = world::layer::top_layer(&mut data.biome_list, &chunk)
+			}) = world::layer::top_layer(&mut data.biome_list, &chunk, self.slice)
 				.with_context(|| format!("Failed to process chunk {chunk_coords:?}"))?
 		{
 			if self.output_needed {
