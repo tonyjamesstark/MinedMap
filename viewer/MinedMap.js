@@ -328,6 +328,46 @@ async function loadSigns(signLayer, base) {
 	}
 }
 
+function createMarkerPopup(marker) {
+	const el = document.createElement('div');
+	for (const line of marker.text) {
+		const b = document.createElement('b');
+		b.textContent = line;
+		el.appendChild(b);
+		el.appendChild(document.createElement('br'));
+	}
+	el.appendChild(document.createTextNode(
+		`${Math.floor(marker.x)} / ${Math.floor(marker.y)} / ${Math.floor(marker.z)}`));
+	return el;
+}
+
+async function createRegionPopup(layer, x, z) {
+	const name = `r.${x}.${z}`;
+	const url = `${layer.downloads.path}/${name}.${layer.downloads.ext ?? 'zip'}`;
+
+	const el = document.createElement('div');
+	const title = document.createElement('b');
+	title.textContent = `Region ${name}`;
+	el.appendChild(title);
+	el.appendChild(document.createElement('br'));
+	el.appendChild(document.createTextNode(
+		`X ${512*x} to ${512*x+511}, Z ${512*z} to ${512*z+511}`));
+	el.appendChild(document.createElement('br'));
+
+	const link = document.createElement('a');
+	link.href = url;
+	link.download = '';
+	link.textContent = 'Download';
+	el.appendChild(link);
+
+	const response = await fetch(url, {method: 'HEAD'});
+	const size = response.ok && response.headers.get('Content-Length');
+	if (size)
+		link.textContent += ` (${(size / 1048576).toFixed(1)} MB)`;
+
+	return el;
+}
+
 window.createMap = function () {
 	(async function () {
 		// layers.json lists alternative data directories (e.g. cave slices or
@@ -346,6 +386,10 @@ window.createMap = function () {
 				scale: def.scale ?? 1,
 				info,
 				features: info.features || {},
+				markerSets: await Promise.all((def.markers ?? []).map(async (path) => {
+					const response = await fetch(path, {cache: 'no-store'});
+					return response.json();
+				})),
 				mapLayer: new MinedMapLayer(info.mipmaps, 'map', tile_extension, def.path),
 				lightLayer: new MinedMapLayer(info.mipmaps, 'light', tile_extension, def.path),
 			};
@@ -413,6 +457,14 @@ window.createMap = function () {
 			overlayMaps['Signs'] = signLayer;
 		}
 
+		// One overlay per marker set label, filled from the active layer
+		const markerRenderer = L.canvas();
+		const markerOverlays = {};
+		for (const layer of layers)
+			for (const set of layer.markerSets)
+				markerOverlays[set.label] ??= L.layerGroup().addTo(map);
+		Object.assign(overlayMaps, markerOverlays);
+
 		// Switches the active layer; the map view is left to the caller
 		const activate = function (layer) {
 			active = layer;
@@ -427,6 +479,30 @@ window.createMap = function () {
 				delete markers[key];
 			if (layer.features.signs)
 				loadSigns(signLayer, layer.path);
+
+			for (const group of Object.values(markerOverlays))
+				group.clearLayers();
+			for (const set of layer.markerSets) {
+				for (const marker of set.markers) {
+					L.circleMarker([-marker.z-0.5, marker.x+0.5], {
+						renderer: markerRenderer,
+						radius: 5,
+						color: '#000',
+						weight: 1,
+						fillColor: '#ffcc00',
+						fillOpacity: 0.9,
+						bubblingMouseEvents: false,
+					})
+						.bindTooltip(() => {
+							// Marker text is user input: never let Leaflet parse it as HTML
+							const el = document.createElement('span');
+							el.textContent = marker.text.join(': ');
+							return el;
+						})
+						.bindPopup(() => createMarkerPopup(marker), {className: 'info-popup'})
+						.addTo(markerOverlays[set.label]);
+				}
+			}
 		};
 
 		activate(params.layer);
@@ -490,6 +566,21 @@ window.createMap = function () {
 		map.on('zoomend', refreshHash);
 		map.on('layeradd', refreshHash);
 		map.on('layerremove', refreshHash);
+
+		map.on('click', async function (ev) {
+			const layer = active;
+			if (!layer.downloads)
+				return;
+
+			const x = Math.floor(ev.latlng.lng / 512);
+			const z = Math.floor(-ev.latlng.lat / 512);
+			if (!contains(layer.info.mipmaps[0].regions[z] || [], x))
+				return;
+
+			const content = await createRegionPopup(layer, x, z);
+			if (layer === active)
+				L.popup({className: 'info-popup'}).setLatLng(ev.latlng).setContent(content).openOn(map);
+		});
 
 		map.on('baselayerchange', function (ev) {
 			const layer = layers.find((layer) => layer.mapLayer === ev.layer);
