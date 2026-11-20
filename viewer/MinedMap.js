@@ -343,7 +343,9 @@ function createMarkerPopup(marker) {
 
 async function createRegionPopup(layer, x, z) {
 	const name = `r.${x}.${z}`;
-	const url = `${layer.downloads.path}/${name}.${layer.downloads.ext ?? 'zip'}`;
+	const {downloads} = layer;
+	const ext = downloads.ext ?? 'zip';
+	const variants = downloads.variants ?? [{label: 'Download', path: downloads.path}];
 
 	const el = document.createElement('div');
 	const title = document.createElement('b');
@@ -352,30 +354,73 @@ async function createRegionPopup(layer, x, z) {
 	el.appendChild(document.createElement('br'));
 	el.appendChild(document.createTextNode(
 		`X ${512*x} to ${512*x+511}, Z ${512*z} to ${512*z+511}`));
-	el.appendChild(document.createElement('br'));
 
-	const link = document.createElement('a');
-	link.href = url;
-	link.download = '';
-	link.textContent = 'Download';
-	el.appendChild(link);
+	// A variant may leave regions out (e.g. one that keeps only lived-in chunks)
+	const sizes = await Promise.all(variants.map(async (variant) => {
+		const response = await fetch(`${variant.path}/${name}.${ext}`, {method: 'HEAD'});
+		return response.ok ? +(response.headers.get('Content-Length') ?? 0) : null;
+	}));
+	variants.forEach((variant, i) => {
+		el.appendChild(document.createElement('br'));
+		if (sizes[i] === null) {
+			el.appendChild(document.createTextNode(`${variant.label}: not available`));
+			return;
+		}
+		const link = document.createElement('a');
+		link.href = `${variant.path}/${name}.${ext}`;
+		link.download = '';
+		link.textContent = variant.label;
+		if (sizes[i])
+			link.textContent += ` (${(sizes[i] / 1048576).toFixed(1)} MB)`;
+		el.appendChild(link);
+	});
 
-	const response = await fetch(url, {method: 'HEAD'});
-	const size = response.ok && response.headers.get('Content-Length');
-	if (size)
-		link.textContent += ` (${(size / 1048576).toFixed(1)} MB)`;
+	if (downloads.help) {
+		const help = document.createElement('a');
+		help.href = downloads.help;
+		help.target = '_blank';
+		help.textContent = 'How to use';
+		el.appendChild(document.createElement('br'));
+		el.appendChild(help);
+	}
 
 	return el;
 }
 
+const LinksControl = L.Control.extend({
+	initialize: function (links, options) {
+		this.links = links;
+		L.setOptions(this, options);
+	},
+
+	onAdd: function () {
+		const el = L.DomUtil.create('div', 'leaflet-control-attribution links-control');
+		this.links.forEach((entry, i) => {
+			if (i)
+				el.appendChild(document.createTextNode(' · '));
+			const link = document.createElement('a');
+			link.href = entry.href;
+			link.target = '_blank';
+			link.textContent = entry.label;
+			el.appendChild(link);
+		});
+		return el;
+	},
+});
+
 window.createMap = function () {
 	(async function () {
 		// layers.json lists alternative data directories (e.g. cave slices or
-		// other dimensions); without it, the single 'data' directory is used.
+		// other dimensions), either as an array or as {layers, links}; without
+		// it, the single 'data' directory is used.
 		let layerDefs = [{id: '', label: '', path: 'data'}];
+		let links = [];
 		const layersResponse = await fetch('layers.json', {cache: 'no-store'});
-		if (layersResponse.ok)
-			layerDefs = await layersResponse.json();
+		if (layersResponse.ok) {
+			const config = await layersResponse.json();
+			layerDefs = Array.isArray(config) ? config : config.layers;
+			links = Array.isArray(config) ? [] : config.links ?? [];
+		}
 
 		const layers = await Promise.all(layerDefs.map(async (def) => {
 			const response = await fetch(`${def.path}/info.json`, {cache: 'no-store'});
@@ -517,6 +562,9 @@ window.createMap = function () {
 
 		const coordControl = new CoordControl();
 		coordControl.addTo(map);
+
+		if (links.length)
+			new LinksControl(links, {position: 'bottomleft'}).addTo(map);
 
 		map.on('mousemove', function(e) {
 			coordControl.update(Math.round(e.latlng.lng), Math.round(-e.latlng.lat));
