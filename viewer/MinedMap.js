@@ -73,7 +73,7 @@ function signIcon(material, kind) {
 }
 
 const MinedMapLayer = L.TileLayer.extend({
-	initialize: function (mipmaps, layer, tile_extension) {
+	initialize: function (mipmaps, layer, tile_extension, base) {
 		L.TileLayer.prototype.initialize.call(this, '', {
 			detectRetina: true,
 			tileSize: 512,
@@ -89,6 +89,7 @@ const MinedMapLayer = L.TileLayer.extend({
 		this.mipmaps = mipmaps;
 		this.layer = layer;
 		this.ext = tile_extension;
+		this.base = base;
 	},
 
 	createTile: function (coords, done) {
@@ -113,7 +114,7 @@ const MinedMapLayer = L.TileLayer.extend({
 			return L.Util.emptyImageUrl;
 
 
-		return `data/${this.layer}/${z}/r.${coords.x}.${coords.y}.${this.ext}`;
+		return `${this.base}/${this.layer}/${z}/r.${coords.x}.${coords.y}.${this.ext}`;
 	},
 });
 
@@ -268,8 +269,8 @@ function createSign(sign, back) {
 	return wrapper;
 }
 
-async function loadSigns(signLayer) {
-	const response = await fetch('data/entities.json', {cache: 'no-store'});
+async function loadSigns(signLayer, base) {
+	const response = await fetch(`${base}/entities.json`, {cache: 'no-store'});
 	const res = await response.json();
 
 	const groups = {};
@@ -329,11 +330,29 @@ async function loadSigns(signLayer) {
 
 window.createMap = function () {
 	(async function () {
-		const response = await fetch('data/info.json', {cache: 'no-store'});
-		const res = await response.json();
-		const {mipmaps, spawn} = res;
-		const features = res.features || {};
-		const tile_extension = res.tile_extension || 'png';
+		// layers.json lists alternative data directories (e.g. cave slices or
+		// other dimensions); without it, the single 'data' directory is used.
+		let layerDefs = [{id: '', label: '', path: 'data'}];
+		const layersResponse = await fetch('layers.json', {cache: 'no-store'});
+		if (layersResponse.ok)
+			layerDefs = await layersResponse.json();
+
+		const layers = await Promise.all(layerDefs.map(async (def) => {
+			const response = await fetch(`${def.path}/info.json`, {cache: 'no-store'});
+			const info = await response.json();
+			const tile_extension = info.tile_extension || 'png';
+			return {
+				...def,
+				scale: def.scale ?? 1,
+				info,
+				features: info.features || {},
+				mapLayer: new MinedMapLayer(info.mipmaps, 'map', tile_extension, def.path),
+				lightLayer: new MinedMapLayer(info.mipmaps, 'light', tile_extension, def.path),
+			};
+		}));
+		const layerById = Object.fromEntries(layers.map((layer) => [layer.id, layer]));
+		const {spawn} = layers[0].info;
+		let active = layers[0];
 
 		const updateParams = function () {
 			const args = parseHash();
@@ -344,29 +363,33 @@ window.createMap = function () {
 			params.light = parseInt(args['light']);
 			params.signs = parseInt(args['signs'] ?? '1');
 			params.marker = (args['marker'] ?? '').split(',').map((i) => +i);
+			params.layer = layerById[args['layer']] ?? layers[0];
 
 			if (isNaN(params.zoom))
 				params.zoom = 0;
 			if (isNaN(params.x))
-				params.x = spawn.x;
+				params.x = spawn.x / params.layer.scale;
 			if (isNaN(params.z))
-				params.z = spawn.z;
-			if (!features.signs || isNaN(params.marker[0]) || isNaN(params.marker[1]))
+				params.z = spawn.z / params.layer.scale;
+			if (!params.layer.features.signs || isNaN(params.marker[0]) || isNaN(params.marker[1]))
 				params.marker = null;
 		};
 
 		updateParams();
 
+		const layerBounds = function (layer) {
+			const {bounds} = layer.info.mipmaps[0];
+			return [
+				[-512*(bounds.maxZ+1), 512*bounds.minX],
+				[-512*bounds.minZ, 512*(bounds.maxX+1)],
+			];
+		};
+
 		const map = L.map('map', {
 			center: [-params.z, params.x],
 			zoom: params.zoom,
-			minZoom: -(mipmaps.length-1),
 			maxZoom: 5,
 			crs: L.CRS.Simple,
-			maxBounds: [
-				[-512*(mipmaps[0].bounds.maxZ+1), 512*mipmaps[0].bounds.minX],
-				[-512*mipmaps[0].bounds.minZ, 512*(mipmaps[0].bounds.maxX+1)],
-			],
 		});
 
 		const refocus = function() {
@@ -376,25 +399,45 @@ window.createMap = function () {
 
 		const overlayMaps = {};
 
-		const mapLayer = new MinedMapLayer(mipmaps, 'map', tile_extension);
-		mapLayer.addTo(map);
-
-		const lightLayer = new MinedMapLayer(mipmaps, 'light', tile_extension);
+		// Overlays are groups whose content follows the active layer
+		const lightLayer = L.layerGroup();
 		overlayMaps['Illumination'] = lightLayer;
 		if (params.light)
 			map.addLayer(lightLayer);
 
-		let signLayer;
-		if (features.signs) {
-			signLayer = L.layerGroup();
-			loadSigns(signLayer);
+		const signLayer = L.layerGroup();
+		if (layers.some((layer) => layer.features.signs)) {
 			if (params.signs)
 				map.addLayer(signLayer);
 
 			overlayMaps['Signs'] = signLayer;
 		}
 
-		L.control.layers({}, overlayMaps).addTo(map);
+		// Switches the active layer; the map view is left to the caller
+		const activate = function (layer) {
+			active = layer;
+			map.setMinZoom(-(layer.info.mipmaps.length-1));
+			map.setMaxBounds(layerBounds(layer));
+
+			lightLayer.clearLayers();
+			lightLayer.addLayer(layer.lightLayer);
+
+			signLayer.clearLayers();
+			for (const key of Object.keys(markers))
+				delete markers[key];
+			if (layer.features.signs)
+				loadSigns(signLayer, layer.path);
+		};
+
+		activate(params.layer);
+		params.layer.mapLayer.addTo(map);
+
+		const baseMaps = {};
+		if (layers.length > 1)
+			for (const layer of layers)
+				baseMaps[layer.label] = layer.mapLayer;
+
+		L.control.layers(baseMaps, overlayMaps).addTo(map);
 
 		const coordControl = new CoordControl();
 		coordControl.addTo(map);
@@ -409,9 +452,11 @@ window.createMap = function () {
 			if (params.zoom != 0)
 				ret += '&zoom='+params.zoom;
 
+			if (active !== layers[0])
+				ret += '&layer='+active.id;
 			if (map.hasLayer(lightLayer))
 				ret += '&light=1';
-			if (features.signs && !map.hasLayer(signLayer))
+			if (active.features.signs && !map.hasLayer(signLayer))
 				ret += '&signs=0';
 			if (params.marker) {
 				ret += `&marker=${params.marker[0]},${params.marker[1]}`;
@@ -446,6 +491,17 @@ window.createMap = function () {
 		map.on('layeradd', refreshHash);
 		map.on('layerremove', refreshHash);
 
+		map.on('baselayerchange', function (ev) {
+			const layer = layers.find((layer) => layer.mapLayer === ev.layer);
+			const ratio = active.scale / layer.scale;
+			const center = map.getCenter();
+
+			activate(layer);
+			params.marker = null;
+			map.setView([center.lat*ratio, center.lng*ratio], map.getZoom());
+			refreshHash({type: 'baselayerchange'});
+		});
+
 		window.onhashchange = function () {
 			// Keep keyboard focus on map when popups open or close
 			refocus();
@@ -456,13 +512,21 @@ window.createMap = function () {
 			const prevMarkerCoords = params.marker;
 
 			updateParams();
+			// Switching layers can move the map, which overwrites params
+			const view = {center: [-params.z, params.x], zoom: params.zoom};
 
 			if (params.light)
 				map.addLayer(lightLayer);
 			else
 				map.removeLayer(lightLayer);
 
-			if (features.signs) {
+			if (params.layer !== active) {
+				map.removeLayer(active.mapLayer);
+				activate(params.layer);
+				params.layer.mapLayer.addTo(map);
+			}
+
+			if (active.features.signs) {
 				if (params.signs)
 					map.addLayer(signLayer);
 				else
@@ -472,7 +536,7 @@ window.createMap = function () {
 					getMarker(params.marker)?.openPopup();
 			}
 
-			map.setView([-params.z, params.x], params.zoom);
+			map.setView(view.center, view.zoom);
 
 			updateHash();
 		};
