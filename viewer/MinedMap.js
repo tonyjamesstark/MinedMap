@@ -341,7 +341,7 @@ function createMarkerPopup(marker) {
 	return el;
 }
 
-async function createRegionPopup(layer, x, z) {
+async function createRegionPopup(layer, x, z, selection) {
 	const name = `r.${x}.${z}`;
 	const {downloads} = layer;
 	const ext = downloads.ext ?? 'zip';
@@ -375,6 +375,22 @@ async function createRegionPopup(layer, x, z) {
 		el.appendChild(link);
 	});
 
+	if (selection && sizes[0] !== null) {
+		const toggle = document.createElement('button');
+		toggle.type = 'button';
+		toggle.className = 'link-button';
+		const label = () => {
+			toggle.textContent = selection.has(x, z) ? 'Remove from selection' : 'Add to selection';
+		};
+		label();
+		toggle.onclick = async () => {
+			await selection.toggle(layer, [[x, z]]);
+			label();
+		};
+		el.appendChild(document.createElement('br'));
+		el.appendChild(toggle);
+	}
+
 	if (downloads.help) {
 		const help = document.createElement('a');
 		help.href = downloads.help;
@@ -385,6 +401,348 @@ async function createRegionPopup(layer, x, z) {
 	}
 
 	return el;
+}
+
+// Entries of a zip without ZIP64, with their compressed data as views into buf
+function readZip(buf) {
+	const v = new DataView(buf);
+	let eocd = -1;
+	for (let i = buf.byteLength - 22; i >= Math.max(0, buf.byteLength - 65557); i--) {
+		if (v.getUint32(i, true) === 0x06054b50) {
+			eocd = i;
+			break;
+		}
+	}
+	if (eocd < 0)
+		throw new Error('not a zip file');
+
+	const decoder = new TextDecoder();
+	const entries = [];
+	let p = v.getUint32(eocd + 16, true);
+	for (let n = v.getUint16(eocd + 10, true); n > 0; n--) {
+		if (v.getUint32(p, true) !== 0x02014b50)
+			throw new Error('bad zip central directory');
+		const nameLen = v.getUint16(p + 28, true);
+		const csize = v.getUint32(p + 20, true);
+		const offset = v.getUint32(p + 42, true);
+		if (csize === 0xffffffff || offset === 0xffffffff)
+			throw new Error('ZIP64 is not supported');
+		const dataStart = offset + 30 + v.getUint16(offset + 26, true) + v.getUint16(offset + 28, true);
+		entries.push({
+			name: decoder.decode(new Uint8Array(buf, p + 46, nameLen)),
+			madeBy: v.getUint16(p + 4, true),
+			flags: v.getUint16(p + 8, true),
+			method: v.getUint16(p + 10, true),
+			time: v.getUint16(p + 12, true),
+			date: v.getUint16(p + 14, true),
+			crc: v.getUint32(p + 16, true),
+			csize,
+			usize: v.getUint32(p + 24, true),
+			extAttr: v.getUint32(p + 38, true),
+			data: new Uint8Array(buf, dataStart, csize),
+		});
+		p += 46 + nameLen + v.getUint16(p + 30, true) + v.getUint16(p + 32, true);
+	}
+	return entries;
+}
+
+// Copies entries into a new zip as they are: no recompression, so it is fast and CRCs hold
+function writeZip(entries) {
+	const encoder = new TextEncoder();
+	const parts = [];
+	const central = [];
+	let offset = 0;
+	let centralSize = 0;
+
+	for (const e of entries) {
+		const name = encoder.encode(e.name);
+		// Drop the data descriptor bit (sizes are in the header now); names are UTF-8
+		const flags = (e.flags & ~0x8) | 0x800;
+
+		const local = new DataView(new ArrayBuffer(30));
+		local.setUint32(0, 0x04034b50, true);
+		local.setUint16(4, 20, true);
+		local.setUint16(6, flags, true);
+		local.setUint16(8, e.method, true);
+		local.setUint16(10, e.time, true);
+		local.setUint16(12, e.date, true);
+		local.setUint32(14, e.crc, true);
+		local.setUint32(18, e.csize, true);
+		local.setUint32(22, e.usize, true);
+		local.setUint16(26, name.length, true);
+		parts.push(local, name, e.data);
+
+		const dir = new DataView(new ArrayBuffer(46));
+		dir.setUint32(0, 0x02014b50, true);
+		dir.setUint16(4, e.madeBy, true);
+		dir.setUint16(6, 20, true);
+		dir.setUint16(8, flags, true);
+		dir.setUint16(10, e.method, true);
+		dir.setUint16(12, e.time, true);
+		dir.setUint16(14, e.date, true);
+		dir.setUint32(16, e.crc, true);
+		dir.setUint32(20, e.csize, true);
+		dir.setUint32(24, e.usize, true);
+		dir.setUint16(28, name.length, true);
+		dir.setUint32(38, e.extAttr, true);
+		dir.setUint32(42, offset, true);
+		central.push(dir, name);
+
+		offset += 30 + name.length + e.csize;
+		centralSize += 46 + name.length;
+	}
+	if (entries.length > 0xffff || offset + centralSize > 0xffffffff)
+		throw new Error('selection too large for one zip');
+
+	const end = new DataView(new ArrayBuffer(22));
+	end.setUint32(0, 0x06054b50, true);
+	end.setUint16(8, entries.length, true);
+	end.setUint16(10, entries.length, true);
+	end.setUint32(12, centralSize, true);
+	end.setUint32(16, offset, true);
+
+	return new Blob([...parts, ...central, end], {type: 'application/zip'});
+}
+
+// Region zips each hold one world folder; merge them under one root folder. The first zip
+// wins for shared files (level.dat and its spawn, data/, datapacks/).
+function mergeRegionZips(buffers, root) {
+	const seen = new Set();
+	const entries = [];
+	for (const buf of buffers) {
+		for (const entry of readZip(buf)) {
+			const slash = entry.name.indexOf('/');
+			const name = root + (slash < 0 ? '/' + entry.name : entry.name.slice(slash));
+			if (seen.has(name))
+				continue;
+			seen.add(name);
+			entries.push({...entry, name});
+		}
+	}
+	return writeZip(entries);
+}
+
+// Browsers hold the whole selection in memory while the zip is assembled
+const SELECTION_MAX_BYTES = 1024 * 1048576;
+const SELECTION_MAX_DRAG = 256;
+
+const formatMB = (bytes) => `${(bytes / 1048576).toFixed(1)} MB`;
+
+const SelectionControl = L.Control.extend({
+	initialize: function (selection) {
+		this.selection = selection;
+		this.options.position = 'topleft';
+	},
+
+	onAdd: function () {
+		const el = L.DomUtil.create('div', 'leaflet-bar selection-control');
+		L.DomEvent.disableClickPropagation(el);
+		L.DomEvent.disableScrollPropagation(el);
+
+		this.summary = L.DomUtil.create('div', 'selection-summary', el);
+		this.status = L.DomUtil.create('div', 'selection-status', el);
+
+		const buttons = L.DomUtil.create('div', '', el);
+		this.download = L.DomUtil.create('button', '', buttons);
+		this.download.type = 'button';
+		this.download.textContent = 'Download as one world';
+		this.download.onclick = () => this.selection.download();
+		this.clear = L.DomUtil.create('button', '', buttons);
+		this.clear.type = 'button';
+		this.clear.textContent = 'Clear';
+		this.clear.onclick = () => this.selection.clear();
+
+		this.update();
+		return el;
+	},
+
+	update: function (status) {
+		if (!this.summary)
+			return;
+		const {count, bytes, busy} = this.selection;
+		this.summary.textContent = count
+			? `${count} region${count === 1 ? '' : 's'} selected, ${formatMB(bytes)}`
+			: 'Select regions: shift-click or shift-drag, or "Add to selection" in a region popup';
+		if (status !== undefined)
+			this.status.textContent = status;
+		this.download.disabled = busy || !count;
+		this.clear.disabled = busy || !count;
+	},
+});
+
+function createSelection(map) {
+	const regions = new Map();
+	const group = L.layerGroup().addTo(map);
+	let path = null;
+	let ext = 'zip';
+	let control = null;
+
+	const key = (x, z) => `${x},${z}`;
+	const bounds = (x, z) => [[-512*(z+1), 512*x], [-512*z, 512*(x+1)]];
+	const sizeOf = async (x, z) => {
+		const response = await fetch(`${path}/r.${x}.${z}.${ext}`, {method: 'HEAD'});
+		return response.ok ? +(response.headers.get('Content-Length') ?? 0) : null;
+	};
+
+	const selection = {
+		busy: false,
+		get count() { return regions.size; },
+		get bytes() {
+			let total = 0;
+			for (const region of regions.values())
+				total += region.size;
+			return total;
+		},
+
+		has: (x, z) => regions.has(key(x, z)),
+
+		// Follows the active layer: layers that share a download folder (cave slices of
+		// the overworld) keep the selection, any other clears it
+		follow(layer) {
+			const variant = layer.downloads?.variants?.[0] ?? layer.downloads;
+			const next = variant?.path ?? null;
+			if (next !== path)
+				selection.clear();
+			path = next;
+			ext = layer.downloads?.ext ?? 'zip';
+			selection.layer = layer;
+			if (!path && control) {
+				control.remove();
+				control = null;
+			} else if (path && !control) {
+				control = new SelectionControl(selection).addTo(map);
+			}
+		},
+
+		// Toggles one region, or adds every available region in a dragged range
+		async toggle(layer, cells) {
+			if (!path || selection.busy)
+				return;
+			const rendered = layer.info.mipmaps[0].regions;
+			cells = cells.filter(([x, z]) => contains(rendered[z] || [], x));
+			if (cells.length === 1 && selection.has(...cells[0])) {
+				const [x, z] = cells[0];
+				group.removeLayer(regions.get(key(x, z)).rect);
+				regions.delete(key(x, z));
+				control?.update('');
+				return;
+			}
+			cells = cells.filter(([x, z]) => !selection.has(x, z));
+			if (cells.length > SELECTION_MAX_DRAG) {
+				control?.update(`That covers ${cells.length} regions; select at most ${SELECTION_MAX_DRAG} at a time.`);
+				return;
+			}
+			const sizes = await Promise.all(cells.map(([x, z]) => sizeOf(x, z)));
+			let total = selection.bytes;
+			let skipped = 0;
+			cells.forEach(([x, z], i) => {
+				if (sizes[i] === null || selection.has(x, z))
+					return;
+				if (total + sizes[i] > SELECTION_MAX_BYTES) {
+					skipped++;
+					return;
+				}
+				total += sizes[i];
+				const rect = L.rectangle(bounds(x, z), {
+					color: '#ffcc00', weight: 2, fillOpacity: 0.15, interactive: false,
+				}).addTo(group);
+				regions.set(key(x, z), {x, z, size: sizes[i], rect});
+			});
+			control?.update(skipped
+				? `${skipped} region${skipped === 1 ? '' : 's'} left out: one download holds at most ${formatMB(SELECTION_MAX_BYTES)}.`
+				: '');
+		},
+
+		clear() {
+			regions.clear();
+			group.clearLayers();
+			control?.update('');
+		},
+
+		async download() {
+			if (!regions.size || selection.busy)
+				return;
+			selection.busy = true;
+			try {
+				// Spawn in the region nearest the middle of the selection
+				const list = [...regions.values()];
+				const cx = list.reduce((s, r) => s + r.x, 0) / list.length;
+				const cz = list.reduce((s, r) => s + r.z, 0) / list.length;
+				list.sort((a, b) => ((a.x-cx)**2 + (a.z-cz)**2) - ((b.x-cx)**2 + (b.z-cz)**2));
+
+				const buffers = [];
+				for (const [i, region] of list.entries()) {
+					control?.update(`Fetching region ${i+1} of ${list.length}...`);
+					const response = await fetch(`${path}/r.${region.x}.${region.z}.${ext}`);
+					if (!response.ok)
+						throw new Error(`r.${region.x}.${region.z}: HTTP ${response.status}`);
+					buffers.push(await response.arrayBuffer());
+				}
+
+				control?.update('Building the zip...');
+				const first = readZip(buffers[0])[0].name;
+				const root = first.slice(0, first.indexOf('/')).replace(/-r\.-?\d+\.-?\d+$/, '') +
+					`-${list.length}-regions`;
+				const url = URL.createObjectURL(mergeRegionZips(buffers, root));
+				const link = document.createElement('a');
+				link.href = url;
+				link.download = `${root}.zip`;
+				document.body.appendChild(link);
+				link.click();
+				link.remove();
+				setTimeout(() => URL.revokeObjectURL(url), 60000);
+				control?.update(`Saved ${root}.zip`);
+			} catch (e) {
+				control?.update(`Download failed: ${e.message}`);
+			} finally {
+				selection.busy = false;
+				control?.update();
+			}
+		},
+	};
+
+	// Shift-drag selects a range of regions (in place of Leaflet's shift-drag zoom)
+	let start = null;
+	let box = null;
+	const cell = (latlng) => [Math.floor(latlng.lng / 512), Math.floor(-latlng.lat / 512)];
+	// Capture phase: Leaflet's own drag handler would otherwise start panning first
+	map.getContainer().addEventListener('mousedown', (ev) => {
+		if (path && ev.shiftKey && ev.button === 0)
+			map.dragging.disable();
+	}, true);
+	map.on('mousedown', (ev) => {
+		if (!path || !ev.originalEvent.shiftKey)
+			return;
+		start = ev.latlng;
+	});
+	map.on('mousemove', (ev) => {
+		if (!start)
+			return;
+		const b = L.latLngBounds(start, ev.latlng);
+		if (box)
+			box.setBounds(b);
+		else
+			box = L.rectangle(b, {color: '#ffcc00', weight: 1, dashArray: '4', fill: false, interactive: false}).addTo(map);
+	});
+	document.addEventListener('mouseup', () => map.dragging.enable());
+	map.on('mouseup', (ev) => {
+		if (!start)
+			return;
+		const [x0, z0] = cell(start), [x1, z1] = cell(ev.latlng);
+		start = null;
+		box?.remove();
+		box = null;
+		const cells = [];
+		for (let z = Math.min(z0, z1); z <= Math.max(z0, z1); z++)
+			for (let x = Math.min(x0, x1); x <= Math.max(x0, x1); x++)
+				cells.push([x, z]);
+		if (cells.length <= SELECTION_MAX_DRAG * 4)
+			selection.toggle(selection.layer, cells);
+		else
+			control?.update(`That covers ${cells.length} regions; select at most ${SELECTION_MAX_DRAG} at a time.`);
+	});
+
+	return selection;
 }
 
 const LinksControl = L.Control.extend({
@@ -477,9 +835,14 @@ window.createMap = function () {
 		const map = L.map('map', {
 			center: [-params.z, params.x],
 			zoom: params.zoom,
+			// Layers add their min zoom only later; without this a negative hash zoom clamps to 0
+			minZoom: -(params.layer.info.mipmaps.length-1),
 			maxZoom: 5,
 			crs: L.CRS.Simple,
+			boxZoom: false,
 		});
+
+		const selection = createSelection(map);
 
 		const refocus = function() {
 			map.getContainer().focus();
@@ -513,6 +876,7 @@ window.createMap = function () {
 		// Switches the active layer; the map view is left to the caller
 		const activate = function (layer) {
 			active = layer;
+			selection.follow(layer);
 			map.setMinZoom(-(layer.info.mipmaps.length-1));
 			map.setMaxBounds(layerBounds(layer));
 
@@ -558,7 +922,11 @@ window.createMap = function () {
 			for (const layer of layers)
 				baseMaps[layer.label] = layer.mapLayer;
 
-		L.control.layers(baseMaps, overlayMaps).addTo(map);
+		const layersControl = L.control.layers(baseMaps, overlayMaps);
+		// Leaflet greys out layers with fewer zoom levels when zoomed out past them;
+		// switching clamps the zoom instead (activate sets the new min zoom)
+		layersControl._checkDisabledLayers = () => {};
+		layersControl.addTo(map);
 
 		const coordControl = new CoordControl();
 		coordControl.addTo(map);
@@ -617,7 +985,7 @@ window.createMap = function () {
 
 		map.on('click', async function (ev) {
 			const layer = active;
-			if (!layer.downloads)
+			if (!layer.downloads || ev.originalEvent.shiftKey)
 				return;
 
 			const x = Math.floor(ev.latlng.lng / 512);
@@ -625,7 +993,7 @@ window.createMap = function () {
 			if (!contains(layer.info.mipmaps[0].regions[z] || [], x))
 				return;
 
-			const content = await createRegionPopup(layer, x, z);
+			const content = await createRegionPopup(layer, x, z, selection);
 			if (layer === active)
 				L.popup({className: 'info-popup'}).setLatLng(ev.latlng).setContent(content).openOn(map);
 		});
